@@ -2,6 +2,7 @@
 // Bridges CIRA runtime (x86_64 host) with Vortex RISC-V SIMT device
 
 #include "vortex_device.h"
+#include "cira_cxl_job.h"
 #include <atomic>
 #include <cinttypes>
 #include <cstring>
@@ -548,103 +549,37 @@ int vortex_device_set_debug(vortex_device_h device, int enable) {
 
 namespace {
 
-constexpr uint64_t VORTEX_CXL_JOB_MAGIC = 0x565843584c4a4f42ULL; // "VXCXLJOB"
-constexpr uint64_t HETGPU_PACC_JOB_MAGIC = 0x4847505550414343ULL; // "HGPUPACC"
-constexpr uint32_t VORTEX_CXL_JOB_VERSION = 1;
-constexpr uint32_t VORTEX_CXL_COMPLETION_MAGIC = 0xDEADBEEF;
-constexpr uint32_t VORTEX_CXL_CACHELINE_SIZE = 64;
+// Wire layout lives in cira_cxl_job.h — shared with the host submit path.
+constexpr uint64_t VORTEX_CXL_JOB_MAGIC = CIRA_CXL_JOB_MAGIC;
+constexpr uint32_t VORTEX_CXL_JOB_VERSION = CIRA_CXL_JOB_VERSION;
+constexpr uint32_t VORTEX_CXL_COMPLETION_MAGIC = CIRA_CXL_COMPLETION_MAGIC;
+constexpr uint32_t VORTEX_CXL_CACHELINE_SIZE = CIRA_CXL_CACHELINE_SIZE;
 
-constexpr uint64_t VORTEX_CXL_DOORBELL_OFF = 0x0;
-constexpr uint64_t VORTEX_CXL_ARG_BASE_OFF = 0x100;
-constexpr uint64_t VORTEX_CXL_ARG_SLOT_BYTES = 0x400;
-constexpr uint64_t VORTEX_CXL_COMPLETION_OFF = 0x1f20;
-constexpr uint64_t VORTEX_CXL_ARG_PAYLOAD_BYTES = VORTEX_CXL_ARG_SLOT_BYTES - sizeof(uint64_t) * 4;
+constexpr uint64_t VORTEX_CXL_DOORBELL_OFF = CIRA_CXL_DOORBELL_OFF;
+constexpr uint64_t VORTEX_CXL_ARG_SLOT_BYTES = CIRA_CXL_ARG_SLOT_BYTES;
+constexpr uint64_t VORTEX_CXL_COMPLETION_OFF = CIRA_CXL_STATUS_OFF;
+constexpr uint64_t VORTEX_CXL_ARG_PAYLOAD_BYTES = CIRA_CXL_ARG_PAYLOAD_BYTES;
 
-enum VortexCxlJobId : uint32_t {
-    VORTEX_CXL_JOB_NOP = 0,
-    VORTEX_CXL_JOB_INSTALL_CACHELINE = 1,
-    VORTEX_CXL_JOB_PREFETCH_CHAIN = 2,
-    VORTEX_CXL_JOB_STREAM_PREFETCH = 3,
-    VORTEX_CXL_JOB_CALL = 4,
-};
+constexpr uint32_t VORTEX_CXL_JOB_NOP = CIRA_CXL_JOB_NOP;
+constexpr uint32_t VORTEX_CXL_JOB_INSTALL_CACHELINE = CIRA_CXL_JOB_INSTALL_CACHELINE;
+constexpr uint32_t VORTEX_CXL_JOB_PREFETCH_CHAIN = CIRA_CXL_JOB_PREFETCH_CHAIN;
+constexpr uint32_t VORTEX_CXL_JOB_STREAM_PREFETCH = CIRA_CXL_JOB_STREAM_PREFETCH;
+constexpr uint32_t VORTEX_CXL_JOB_CALL = CIRA_CXL_JOB_CALL;
 
-enum VortexCxlStatus : uint32_t {
-    VORTEX_CXL_STATUS_SUCCESS = 0,
-    VORTEX_CXL_STATUS_RUNNING = 1,
-    VORTEX_CXL_STATUS_BAD_VERSION = 0xffff0001U,
-    VORTEX_CXL_STATUS_BAD_ARGS = 0xffff0002U,
-    VORTEX_CXL_STATUS_BAD_JOB = 0xffff00ffU,
-};
+constexpr uint32_t VORTEX_CXL_STATUS_SUCCESS = CIRA_CXL_STATUS_SUCCESS;
+constexpr uint32_t VORTEX_CXL_STATUS_RUNNING = CIRA_CXL_STATUS_RUNNING;
+constexpr uint32_t VORTEX_CXL_STATUS_BAD_VERSION = CIRA_CXL_STATUS_BAD_VERSION;
+constexpr uint32_t VORTEX_CXL_STATUS_BAD_ARGS = CIRA_CXL_STATUS_BAD_ARGS;
+constexpr uint32_t VORTEX_CXL_STATUS_BAD_JOB = CIRA_CXL_STATUS_BAD_JOB;
 
-struct VortexCxlDoorbell {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t job_id;
-    uint32_t flags;
-    uint32_t status;
-    uint64_t seq;
-};
-
-struct VortexCxlArgSlotHeader {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t job_id;
-    uint64_t seq;
-    uint64_t arg_len;
-};
-
-struct VortexCxlHostStatus {
-    uint64_t magic;
-    uint32_t version;
-    uint32_t job_id;
-    uint32_t status;
-    uint64_t seq;
-};
-
-struct alignas(VORTEX_CXL_CACHELINE_SIZE) VortexCxlCompletion {
-    uint32_t magic;
-    uint32_t status;
-    uint64_t result;
-    uint64_t cycles;
-    uint64_t timestamp;
-    uint8_t reserved[32];
-};
-
-struct VortexCxlInstallCachelineJob {
-    uint64_t addr;
-    uint64_t size;
-    uint64_t completion_addr;
-    uint32_t cache_level;
-    uint32_t reserved;
-};
-
-struct VortexCxlPrefetchChainJob {
-    uint64_t start_node_addr;
-    uint64_t buf_addr;
-    uint64_t completion_addr;
-    uint32_t depth;
-    uint32_t next_ptr_offset;
-    uint32_t data_offset;
-    uint32_t data_size;
-};
-
-struct VortexCxlStreamPrefetchJob {
-    uint64_t base_addr;
-    uint64_t buf_addr;
-    uint64_t completion_addr;
-    uint64_t count;
-    uint32_t stride;
-    uint32_t elem_size;
-    uint32_t reserved;
-};
-
-struct VortexCxlCallJob {
-    uint64_t func_addr;
-    uint64_t operands_addr;
-    uint64_t completion_addr;
-    uint32_t num_operands;
-    uint32_t reserved;
-};
+using VortexCxlDoorbell = cira_cxl_doorbell_t;
+using VortexCxlArgSlotHeader = cira_cxl_arg_slot_t;
+using VortexCxlHostStatus = cira_cxl_host_status_t;
+using VortexCxlCompletion = cira_cxl_completion_t;
+using VortexCxlInstallCachelineJob = cira_cxl_install_cacheline_job_t;
+using VortexCxlPrefetchChainJob = cira_cxl_prefetch_chain_job_t;
+using VortexCxlStreamPrefetchJob = cira_cxl_stream_prefetch_job_t;
+using VortexCxlCallJob = cira_cxl_call_job_t;
 
 using VortexCxlOffloadFn = void (*)(void **operands, uint32_t num_operands, void *completion);
 
@@ -674,9 +609,7 @@ static inline uint64_t vortex_cxl_cycles() {
 #endif
 }
 
-static inline bool vortex_cxl_valid_magic(uint64_t magic) {
-    return magic == VORTEX_CXL_JOB_MAGIC || magic == HETGPU_PACC_JOB_MAGIC;
-}
+static inline bool vortex_cxl_valid_magic(uint64_t magic) { return cira_cxl_valid_magic(magic) != 0; }
 
 static inline uintptr_t vortex_cxl_align_down(uintptr_t value, uintptr_t align) { return value & ~(align - 1); }
 
@@ -782,8 +715,7 @@ static volatile VortexCxlArgSlotHeader *vortex_cxl_arg_slot(volatile uint8_t *co
     if (job_id > VORTEX_CXL_JOB_CALL)
         return nullptr;
 
-    return reinterpret_cast<volatile VortexCxlArgSlotHeader *>(
-        control + VORTEX_CXL_ARG_BASE_OFF + static_cast<uint64_t>(job_id) * VORTEX_CXL_ARG_SLOT_BYTES);
+    return reinterpret_cast<volatile VortexCxlArgSlotHeader *>(control + cira_cxl_arg_slot_off(job_id));
 }
 
 static const void *vortex_cxl_arg_payload(const volatile VortexCxlArgSlotHeader *slot) {

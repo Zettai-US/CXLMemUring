@@ -53,6 +53,8 @@ set(RUNTIME_SOURCES
     vortex_device.cpp
     vortex_offload_backend.cpp
     cira_jit.cpp                      # JIT cost model (no LLVM dependency)
+    cira_mwait.cpp                    # cache-resident wait (UMWAIT/TPAUSE/WFE)
+    cira_mmio.cpp                     # CXL Type-2 control window + doorbell
 )
 
 # Optional: ORC JIT engine. Built only when LLVM is discoverable so the
@@ -87,6 +89,7 @@ add_library(cira_runtime SHARED ${RUNTIME_SOURCES})
 target_link_libraries(cira_runtime
     PUBLIC
         Threads::Threads
+        ${CMAKE_DL_LIBS}
 )
 
 if(NUMA_SUPPORT)
@@ -115,6 +118,7 @@ set_target_properties(cira_runtime_static PROPERTIES OUTPUT_NAME cira_runtime)
 target_link_libraries(cira_runtime_static
     PUBLIC
         Threads::Threads
+        ${CMAKE_DL_LIBS}
 )
 
 if(NUMA_SUPPORT)
@@ -155,6 +159,13 @@ install(DIRECTORY include/
     FILES_MATCHING PATTERN "*.h"
 )
 
+# Tests (opt-out so the runtime can still be built as a bare dependency)
+option(CIRA_RUNTIME_BUILD_TESTS "Build the CiraRuntime test suite" ON)
+if(CIRA_RUNTIME_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+    enable_testing()
+    add_subdirectory(test)
+endif()
+
 # Print configuration summary
 message(STATUS "")
 message(STATUS "CiraRuntime Configuration:")
@@ -162,5 +173,7 @@ message(STATUS "  Version: ${PROJECT_VERSION}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  NUMA Support: ${NUMA_SUPPORT}")
+message(STATUS "  Vortex SDK: ${VORTEX_FOUND}")
+message(STATUS "  ORC JIT (LLVM): ${CIRA_JIT_HAS_LLVM}")
 message(STATUS "  Install Prefix: ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "")

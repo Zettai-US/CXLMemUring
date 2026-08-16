@@ -1,4 +1,7 @@
 #include "CiraRuntime.h"
+#include "cira_cxl_job.h"
+#include "cira_mmio.h"
+#include "cira_mwait.h"
 #include "vortex_device.h"
 #include <algorithm>
 #include <atomic>
@@ -1057,9 +1060,8 @@ std::unique_ptr<CiraRuntime> CiraRuntime::create() { return std::make_unique<Cir
 
 namespace {
 
-constexpr size_t CIRA_MMIO_DEFAULT_CONTROL_BYTES = VORTEX_CXL_MMIO_CONTROL_BYTES;
-constexpr uint32_t CIRA_COMPLETION_MAGIC = 0xDEADBEEF;
-constexpr size_t CIRA_CACHELINE_BYTES = 64;
+constexpr uint32_t CIRA_COMPLETION_MAGIC = CIRA_CXL_COMPLETION_MAGIC;
+constexpr size_t CIRA_CACHELINE_BYTES = CIRA_CXL_CACHELINE_SIZE;
 
 struct LlcTileMetadata {
     void *allocation = nullptr;
@@ -1068,12 +1070,6 @@ struct LlcTileMetadata {
     void *completion = nullptr;
 };
 
-std::atomic<uint64_t> g_mmio_submit_seq{1};
-std::atomic<void *> g_forced_device_func{nullptr};
-std::mutex g_mmio_map_mutex;
-void *g_mmio_control_window = nullptr;
-size_t g_mmio_control_size = 0;
-int g_mmio_fd = -1;
 std::mutex g_llc_tile_mutex;
 std::unordered_map<void *, LlcTileMetadata> g_llc_tiles;
 
@@ -1117,120 +1113,37 @@ bool env_flag_enabled(const char *name) {
     return value && *value && std::strcmp(value, "0") != 0;
 }
 
-const char *first_env(const char *primary, const char *fallback) {
-    const char *value = std::getenv(primary);
-    if (value && *value)
-        return value;
-    value = std::getenv(fallback);
-    return (value && *value) ? value : nullptr;
-}
-
-void clear_completion(void *completion_ptr) {
-    if (!completion_ptr)
-        return;
-    std::memset(completion_ptr, 0, 64);
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-}
+void clear_completion(void *completion_ptr) { cira_mmio_arm_completion(completion_ptr); }
 
 void complete_in_software(void *completion_ptr, uint32_t status, uint64_t result = 0) {
-    if (!completion_ptr)
-        return;
-
-    auto *base = static_cast<uint8_t *>(completion_ptr);
-    *reinterpret_cast<volatile uint32_t *>(base + 4) = status;
-    *reinterpret_cast<volatile uint64_t *>(base + 8) = result;
-    *reinterpret_cast<volatile uint64_t *>(base + 16) = 0;
-    *reinterpret_cast<volatile uint64_t *>(base + 24) = 0;
-    __atomic_thread_fence(__ATOMIC_RELEASE);
-    *reinterpret_cast<volatile uint32_t *>(base) = CIRA_COMPLETION_MAGIC;
+    cira_mmio_signal_completion(completion_ptr, status, result);
 }
 
-void *configured_device_func(void *func_ptr) {
-    if (func_ptr)
-        return func_ptr;
-
-    void *forced = g_forced_device_func.load(std::memory_order_acquire);
-    if (forced)
-        return forced;
-
-    uint64_t addr = 0;
-    if (parse_env_u64("CIRA_CXL_DEVICE_FUNC_ADDR", addr) || parse_env_u64("CIRA_TYPE2_DEVICE_FUNC_ADDR", addr)) {
-        return reinterpret_cast<void *>(static_cast<uintptr_t>(addr));
-    }
-
-    return nullptr;
-}
-
-void *configured_mmio_control_window() {
-    std::lock_guard<std::mutex> lock(g_mmio_map_mutex);
-    if (g_mmio_control_window)
-        return g_mmio_control_window;
-
-    uint64_t addr = 0;
-    if (parse_env_u64("CIRA_CXL_MMIO_ADDR", addr) || parse_env_u64("CIRA_TYPE2_MMIO_ADDR", addr)) {
-        g_mmio_control_window = reinterpret_cast<void *>(static_cast<uintptr_t>(addr));
-        uint64_t size = CIRA_MMIO_DEFAULT_CONTROL_BYTES;
-        parse_env_u64("CIRA_CXL_MMIO_SIZE", size) || parse_env_u64("CIRA_TYPE2_MMIO_SIZE", size);
-        g_mmio_control_size = static_cast<size_t>(size);
-        return g_mmio_control_window;
-    }
-
-    const char *path = first_env("CIRA_CXL_MMIO_PATH", "CIRA_TYPE2_MMIO_PATH");
-    if (!path)
-        return nullptr;
-
-    uint64_t size = CIRA_MMIO_DEFAULT_CONTROL_BYTES;
-    parse_env_u64("CIRA_CXL_MMIO_SIZE", size) || parse_env_u64("CIRA_TYPE2_MMIO_SIZE", size);
-
-    uint64_t offset = 0;
-    parse_env_u64("CIRA_CXL_MMIO_OFFSET", offset) || parse_env_u64("CIRA_TYPE2_MMIO_OFFSET", offset);
-
-    int fd = open(path, O_RDWR | O_SYNC | O_CLOEXEC);
-    if (fd < 0) {
-        std::cerr << "cira_offload_submit: open MMIO control window " << path << " failed: " << std::strerror(errno)
-                  << std::endl;
-        return nullptr;
-    }
-
-    void *map =
-        mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED, fd, static_cast<off_t>(offset));
-    if (map == MAP_FAILED) {
-        std::cerr << "cira_offload_submit: mmap MMIO control window " << path << " offset=0x" << std::hex << offset
-                  << " size=0x" << size << std::dec << " failed: " << std::strerror(errno) << std::endl;
-        close(fd);
-        return nullptr;
-    }
-
-    g_mmio_fd = fd;
-    g_mmio_control_window = map;
-    g_mmio_control_size = static_cast<size_t>(size);
-    return g_mmio_control_window;
-}
-
+// Hardware path for cira.offload: stage the call job in the CXL Type-2 control
+// window and ring the doorbell.  Returns false when no device is configured,
+// which makes the caller fall back to running the region on the host.
 bool submit_mmio_call(void *func_ptr, void **operands, int num_operands, void *completion_ptr) {
-    void *control = configured_mmio_control_window();
-    if (!control)
+    cira_mmio_window_t *window = cira_mmio_default();
+    if (!window)
         return false;
 
-    void *device_func = configured_device_func(func_ptr);
-    if (!device_func) {
+    uint32_t argc = num_operands > 0 ? static_cast<uint32_t>(num_operands) : 0;
+    uint64_t seq = 0;
+    int rc = cira_mmio_submit_call(window, func_ptr, operands, argc, completion_ptr, &seq);
+    if (rc == CIRA_MMIO_ENODEV) {
         if (env_flag_enabled("CIRA_CXL_MMIO_STRICT")) {
             std::cerr << "cira_offload_submit: MMIO window is configured but "
                       << "no device function address was provided" << std::endl;
         }
         return false;
     }
-
-    uint64_t seq = g_mmio_submit_seq.fetch_add(1, std::memory_order_relaxed);
-    uint32_t argc = num_operands > 0 ? static_cast<uint32_t>(num_operands) : 0;
-    int rc = vortex_cxl_submit_call_mmio(control, seq, device_func, operands, argc, completion_ptr);
-    if (rc != VORTEX_SUCCESS) {
+    if (rc != CIRA_MMIO_OK) {
         std::cerr << "cira_offload_submit: MMIO submit failed, rc=" << rc << std::endl;
         return false;
     }
 
     if (env_flag_enabled("CIRA_CXL_MMIO_WAIT") && completion_ptr) {
-        (void)cira_future_await(completion_ptr);
+        (void)cira_mmio_wait_completion(completion_ptr, cira_mmio_default_timeout_ns());
     }
     return true;
 }
@@ -1630,19 +1543,17 @@ void cira_evict_hint_x86(void *addr, uint64_t size) {
         char *ptr = reinterpret_cast<char *>(cl);
 
 #if defined(__x86_64__) || defined(_M_X64)
-// Try CLDEMOTE first (Granite Rapids+): moves from L1->LLC
-// without evicting from the cache hierarchy entirely.
-// CLDEMOTE is encoded as NOP on pre-Tremont CPUs.
-//
-// Encoding: 0x0F 0x1C /0 (same as CLDEMOTE)
-// GCC/Clang intrinsic:
-#if __has_builtin(__builtin_ia32_cldemote)
-        __builtin_ia32_cldemote(ptr);
+        // CLDEMOTE (Tremont / Granite Rapids+) moves the line from L1 to
+        // the LLC without evicting it from the hierarchy, which is what
+        // cira.evict_hint wants: keep the line reachable, just not local.
+        // It decodes as a NOP on older parts, so it is always safe to
+        // execute; emit it by hand so the build does not require
+        // -mcldemote (and so a -march=native binary still runs elsewhere).
+        //
+        // CLDEMOTE m8 -> 0f 1c /0
+        __asm__ volatile(".byte 0x0f, 0x1c, 0x00" : : "a"(ptr) : "memory");
 #else
-        // Fallback: CLFLUSHOPT (weaker, evicts entirely)
-        // Encoding: 0x66 0x0F 0xAE /7
-        _mm_clflushopt(ptr);
-#endif
+        (void)ptr;
 #endif
     }
 
@@ -1804,42 +1715,18 @@ void *cira_future_await(void *completion_ptr) {
     if (!completion_ptr)
         return nullptr;
 
-    // CompletionData layout:
-    //   [0:4]   magic    (uint32_t) — 0xDEADBEEF when done
+    // cira_cxl_completion_t layout:
+    //   [0:4]   magic    (uint32_t) — CIRA_CXL_COMPLETION_MAGIC when done
     //   [4:8]   status   (uint32_t) — 0 = success
     //   [8:16]  result   (uint64_t) — kernel-specific result
     //   [16:24] cycles   (uint64_t) — execution cycles
     //   [24:32] timestamp(uint64_t) — completion time
     //   [32:64] reserved
-
-    volatile uint32_t *magic_ptr = reinterpret_cast<volatile uint32_t *>(completion_ptr);
-
-    // Spin-wait with MONITOR/MWAIT on Granite Rapids.
-    // MWAIT doesn't alter cstate on newer architectures (confirmed
-    // experimentally on Granite Rapids; spec confirms for WAITPKG).
     //
-    // Fallback: PAUSE-based spin-wait if MWAIT not available.
-
-#if defined(__x86_64__) && __has_builtin(__builtin_ia32_umonitor)
-    // Use UMONITOR/UMWAIT (WAITPKG extension, available on Granite Rapids)
-    while (*magic_ptr != 0xDEADBEEF) {
-        __builtin_ia32_umonitor(const_cast<uint32_t *>(const_cast<volatile uint32_t *>(magic_ptr)));
-        if (*magic_ptr != 0xDEADBEEF) {
-            // UMWAIT: c0 state (lowest power), infinite timeout
-            __builtin_ia32_umwait(0, ~0ULL);
-        }
-    }
-#else
-    // PAUSE-based spin-wait
-    while (*magic_ptr != 0xDEADBEEF) {
-#if defined(__x86_64__)
-        __builtin_ia32_pause();
-#endif
-    }
-#endif
-
-    // Memory fence to ensure we see all data written before magic
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    // The wait itself is the paper's cache-resident poll: a bounded PAUSE
+    // spin, then MONITOR/UMWAIT (or the best equivalent this host has) on
+    // the completion line. See cira_mwait.h.
+    (void)cira_mmio_wait_completion(completion_ptr, cira_mmio_default_timeout_ns());
 
     // Return pointer to the result field (offset 8)
     return reinterpret_cast<char *>(completion_ptr) + 8;
@@ -1864,18 +1751,11 @@ void cira_phase_barrier(void) {
 
     std::lock_guard<std::mutex> lock(futures_mutex);
 
+    const uint64_t timeout_ns = cira_mmio_default_timeout_ns();
     for (void *active_future : active_futures) {
         if (!active_future)
             continue;
-
-        volatile uint32_t *magic_ptr = reinterpret_cast<volatile uint32_t *>(active_future);
-
-        // Spin until this future completes
-        while (*magic_ptr != 0xDEADBEEF) {
-#if defined(__x86_64__)
-            __builtin_ia32_pause();
-#endif
-        }
+        (void)cira_mmio_wait_completion(active_future, timeout_ns);
     }
 
     // All futures complete — full fence
@@ -1886,44 +1766,32 @@ void cira_phase_barrier(void) {
 }
 
 void cira_offload_submit(void *func_ptr, void **operands, int num_operands, void *completion_ptr) {
-    // Submit offload task to device via MMIO ring buffer.
+    // Lowering target for cira.offload. Protocol (cira_cxl_job.h):
+    //   1. stage the call job in the arg slot of the CXL control window
+    //   2. fence, then commit the doorbell with a fresh sequence number
+    //   3. device firmware consumes the doorbell and publishes the
+    //      completion cache line, which the host awaits with
+    //      cira_future_await (MONITOR/UMWAIT, no interrupt)
     //
-    // Protocol:
-    //   1. Write task struct to BAR0 ring buffer entry
-    //   2. Write completion_ptr to task struct
-    //   3. Advance ring buffer write pointer (CSR write)
-    //   4. Device picks up task, executes, writes completion via DCOH
-    //
-    // In simulation/software fallback: call the function directly.
-
-    // For now, use the global Type2GpuDevice instance if available
-    // In real hardware, this writes to BAR0 MMIO registers
-    // matching the CSR layout in Type2CSROffset
-
-    // Software simulation fallback:
-    // Execute the offloaded function on a helper thread
-    // (In real hardware, this goes through the MMIO queue)
+    // With no control window or no device entry point configured, the
+    // region stays on the host and the completion is published in
+    // software so callers see identical semantics either way.
 
     clear_completion(completion_ptr);
     track_active_future(completion_ptr);
 
-    // Hardware/FPGA path: write the call-job struct into the configured
-    // CXL-visible MMIO control window.  The device firmware completes the
-    // future via DCOH once it consumes the doorbell.
     if (submit_mmio_call(func_ptr, operands, num_operands, completion_ptr)) {
         return;
     }
 
-    // Software fallback: no MMIO window or no device function address was
-    // configured, so preserve the old synchronous success behavior.
     complete_in_software(completion_ptr, 0);
 }
 
 void *cira_get_device_func_addr(void) {
-    // In real hardware, this returns the device-side address of the
-    // kernel function loaded in Vortex memory.
-    // For simulation, return nullptr (resolved at runtime).
-    return nullptr;
+    // Device-side address of the loaded kernel, from
+    // CIRA_CXL_DEVICE_FUNC_ADDR or cira_mmio_set_device_func().
+    // NULL means "no device" and selects the software fallback.
+    return cira_mmio_device_func();
 }
 }
 

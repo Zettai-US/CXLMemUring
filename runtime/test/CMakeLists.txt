@@ -1,26 +1,36 @@
 cmake_minimum_required(VERSION 3.10)
 
-# Test executables
-add_executable(test_offload_engine test_offload_engine.cpp)
-target_link_libraries(test_offload_engine cira_runtime)
+# One helper so every test gets the same include paths and link line.
+function(cira_add_runtime_test name source)
+    add_executable(${name} ${source})
+    target_link_libraries(${name} PRIVATE cira_runtime)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-add_executable(test_memory_manager test_memory_manager.cpp)
-target_link_libraries(test_memory_manager cira_runtime)
+# Cost model: pure decision logic, no LLVM and no device required.
+cira_add_runtime_test(test_cira_jit test_cira_jit.cpp)
 
-add_executable(test_graph_runtime test_graph_runtime.cpp)
-target_link_libraries(test_graph_runtime cira_runtime)
+# Dispatch path: cache-resident wait + CXL control window + doorbell protocol.
+# Runs against an emulated (anonymous-memory) window, so no FPGA is needed.
+cira_add_runtime_test(test_cira_offload_path test_cira_offload_path.cpp)
 
-add_executable(test_twopass_runtime test_twopass_runtime.cpp)
-target_link_libraries(test_twopass_runtime cira_runtime)
-target_include_directories(test_twopass_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+# Offload engine / two-pass profiling.
+cira_add_runtime_test(test_offload_engine test_offload_engine.cpp)
+cira_add_runtime_test(test_twopass_runtime test_twopass_runtime.cpp)
 
-add_executable(test_cira_jit test_cira_jit.cpp)
-target_link_libraries(test_cira_jit cira_runtime)
-target_include_directories(test_cira_jit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+# ORC specializer — only built when the runtime was configured with LLVM.
+if(CIRA_JIT_HAS_LLVM)
+    cira_add_runtime_test(test_cira_jit_engine test_cira_jit_engine.cpp)
+endif()
 
-# Add tests
-add_test(NAME OffloadEngineTest COMMAND test_offload_engine)
-add_test(NAME MemoryManagerTest COMMAND test_memory_manager)
-add_test(NAME GraphRuntimeTest COMMAND test_graph_runtime)
-add_test(NAME TwoPassRuntimeTest COMMAND test_twopass_runtime)
-add_test(NAME CiraJitTest COMMAND test_cira_jit)
+# Cost-model microbenchmark — built, but not part of the test suite.
+add_executable(bench_cira_jit bench_cira_jit.cpp)
+target_link_libraries(bench_cira_jit PRIVATE cira_runtime)
+target_include_directories(bench_cira_jit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)

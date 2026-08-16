@@ -4,6 +4,7 @@
 #ifndef VORTEX_DEVICE_H
 #define VORTEX_DEVICE_H
 
+#include "cira_cxl_job.h"
 #include "shared_protocol.h"
 #include <stddef.h>
 #include <stdint.h>
@@ -70,9 +71,9 @@ typedef enum {
 #define VORTEX_ERROR_TIMEOUT -5
 #define VORTEX_ERROR_INVALID -6
 
-// CXL Type-2 MMIO control window layout.  The first 8KB window is shared with
-// the device-side firmware service in vortex_device.cpp.
-#define VORTEX_CXL_MMIO_CONTROL_BYTES 0x2000
+// CXL Type-2 MMIO control window layout.  The wire format itself lives in
+// cira_cxl_job.h and is shared with the host submit path in cira_mmio.cpp.
+#define VORTEX_CXL_MMIO_CONTROL_BYTES CIRA_CXL_CONTROL_BYTES
 
 // ============================================================================
 // Device Management
