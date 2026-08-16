@@ -1,5 +1,7 @@
 add_mlir_dialect_library(MLIRRMEMTransforms
         SearchRemote.cpp
+        BackwardSlice.cpp
+        RegionFormation.cpp
         ADDITIONAL_HEADER_DIRS
         ${PROJECT_SOURCE_DIR}/include
 
@@ -9,6 +11,7 @@ add_mlir_dialect_library(MLIRRMEMTransforms
         LINK_LIBS PUBLIC
         MLIRAnalysis
         MLIRDataLayoutInterfaces
+        MLIRFuncDialect
         MLIRMemRefDialect
         MLIRLLVMDialect
         MLIRVectorDialect

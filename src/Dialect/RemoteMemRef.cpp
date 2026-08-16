@@ -13,7 +13,9 @@ RemoteMemRefType RemoteMemRefType::get(Type elementType, unsigned cacheID) {
 }
 
 // 实现 classof 方法
-bool RemoteMemRefType::classof(Type type) { return llvm::isa<RemoteMemRefType>(type); }
+// NB: must compare TypeIDs directly; llvm::isa<RemoteMemRefType> dispatches
+// back to this function and would recurse forever.
+bool RemoteMemRefType::classof(Type type) { return type && type.getTypeID() == RemoteMemRefType::getTypeID(); }
 
 // 实现 isValidElementType 方法
 bool RemoteMemRefType::isValidElementType(Type elementType) {

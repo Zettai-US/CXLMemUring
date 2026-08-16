@@ -12,6 +12,35 @@ def RMEMSearchRemote : Pass<"rmem-search-remote", "::mlir::ModuleOp"> {
   }];
 }
 
+def CiraRegionFormation : Pass<"cira-region-formation", "::mlir::ModuleOp"> {
+  let summary = "Form device offload regions by backward slicing from remote accesses";
+  let description = [{
+    Implements static region formation (Algorithms 1 and 2 of the CIRA paper).
+
+    For every memory operation that touches CXL-resident data, the pass builds
+    a backward slice from the address operand, recursively including the
+    operations needed to compute that address. Constants and loop-invariant
+    bases terminate the walk without being pulled in; host-only, side-effecting
+    or unsupported operations terminate it and become slice boundaries.
+
+    Slices that are device-legal and actually chase remote memory are cloned
+    into a `cira.offload` region parameterized by the boundary values, and a
+    `cira.barrier` is inserted before the original access.
+  }];
+  let options = [
+    Option<"maxSliceOps", "max-slice-ops", "unsigned",
+           /*default=*/"256",
+           "Maximum number of operations pulled into a single slice">,
+    Option<"followDependentLoads", "follow-loads", "bool",
+           /*default=*/"true",
+           "Follow dependent loads (pointer chasing) while slicing">,
+    Option<"requireProfitable", "require-profitable", "bool",
+           /*default=*/"true",
+           "Only form regions whose dependence chain clears the cost model">
+  ];
+  let dependentDialects = ["::mlir::cira::RemoteMemDialect"];
+}
+
 def GpuOffloadDecision : Pass<"gpu-offload-decision", "::mlir::ModuleOp"> {
   let summary = "Analyze operations and decide which should be offloaded to GPU";
   let description = [{
