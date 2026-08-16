@@ -47,10 +47,10 @@ class LLJIT;
 namespace cira {
 
 // Well-known global names patched by the engine. Match the header docstring.
-constexpr const char* kSentinelBatchSize        = "cira_kBatchSize";
-constexpr const char* kSentinelTraversalDepth   = "cira_kTraversalDepth";
-constexpr const char* kSentinelPipelineDistance = "cira_kPipelineDistance";
-constexpr const char* kSentinelHostDeviceSplit  = "cira_kHostDeviceSplit";
+constexpr const char *kSentinelBatchSize = "cira_kBatchSize";
+constexpr const char *kSentinelTraversalDepth = "cira_kTraversalDepth";
+constexpr const char *kSentinelPipelineDistance = "cira_kPipelineDistance";
+constexpr const char *kSentinelHostDeviceSplit = "cira_kHostDeviceSplit";
 
 // Generic untyped function pointer returned from a successful lookup.
 using CiraJitFn = void (*)();
@@ -64,8 +64,8 @@ public:
     CiraJitEngine();
     ~CiraJitEngine();
 
-    CiraJitEngine(const CiraJitEngine&) = delete;
-    CiraJitEngine& operator=(const CiraJitEngine&) = delete;
+    CiraJitEngine(const CiraJitEngine &) = delete;
+    CiraJitEngine &operator=(const CiraJitEngine &) = delete;
 
     // Specialize `kernelName` inside the IR module read from `bitcodePath`
     // (LLVM bitcode .bc) using the supplied decision, then return a function
@@ -74,14 +74,12 @@ public:
     //
     // The same (bitcodePath, kernelName, fingerprint(decision)) tuple
     // resolves to the same compiled code on subsequent calls.
-    CiraJitFn specialize(const std::string&         bitcodePath,
-                         const std::string&         kernelName,
-                         const cira_jit_decision_t& decision);
+    CiraJitFn specialize(const std::string &bitcodePath, const std::string &kernelName,
+                         const cira_jit_decision_t &decision);
 
     // Same as above but takes raw IR text (useful for unit tests).
-    CiraJitFn specializeFromIR(const std::string&         irText,
-                               const std::string&         kernelName,
-                               const cira_jit_decision_t& decision);
+    CiraJitFn specializeFromIR(const std::string &irText, const std::string &kernelName,
+                               const cira_jit_decision_t &decision);
 
     // Forget all cached compiled code. The underlying LLJIT instance is
     // recreated lazily on the next specialize() call.
@@ -91,15 +89,14 @@ private:
     // Hash-key for the cache: kernel + IR identity + knob fingerprint.
     struct CacheKey {
         std::string kernel;
-        std::string source;     // bitcode path or IR-text hash
-        uint64_t    fingerprint;
-        bool operator==(const CacheKey& o) const noexcept {
-            return fingerprint == o.fingerprint &&
-                   kernel == o.kernel && source == o.source;
+        std::string source; // bitcode path or IR-text hash
+        uint64_t fingerprint;
+        bool operator==(const CacheKey &o) const noexcept {
+            return fingerprint == o.fingerprint && kernel == o.kernel && source == o.source;
         }
     };
     struct CacheKeyHash {
-        size_t operator()(const CacheKey& k) const noexcept {
+        size_t operator()(const CacheKey &k) const noexcept {
             // Mix kernel/source into the fingerprint — fingerprint already
             // encodes the knobs, so the kernel/source parts are tiebreakers.
             std::hash<std::string> h;
@@ -109,13 +106,12 @@ private:
 
     // Patches the sentinel globals in `module` with the decision's knob
     // values, then runs O3 to fold them into surrounding code.
-    static void patchAndOptimize(llvm::Module&             module,
-                                 const cira_jit_decision_t& decision);
+    static void patchAndOptimize(llvm::Module &module, const cira_jit_decision_t &decision);
 
     // Stable hash of (batch_size, traversal_depth, pipeline_distance,
     // host_device_split, should_offload). Different decisions ⇒ different
     // compiled code; identical decisions ⇒ shared compiled code.
-    static uint64_t fingerprint(const cira_jit_decision_t& d);
+    static uint64_t fingerprint(const cira_jit_decision_t &d);
 
     // Lazily build the underlying LLJIT instance.
     bool ensureLLJIT();
