@@ -17,6 +17,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
@@ -32,6 +33,22 @@ using namespace mlir::cira;
 
 namespace {
 
+/// Recover the originating source file so regions stay attributable after
+/// several translation units have been linked into one module.
+StringRef findSourceFile(Location loc) {
+    if (auto file = dyn_cast<FileLineColLoc>(loc))
+        return file.getFilename().getValue();
+    if (auto fused = dyn_cast<FusedLoc>(loc))
+        for (Location sub : fused.getLocations())
+            if (StringRef name = findSourceFile(sub); !name.empty())
+                return name;
+    if (auto named = dyn_cast<NameLoc>(loc))
+        return findSourceFile(named.getChildLoc());
+    if (auto call = dyn_cast<CallSiteLoc>(loc))
+        return findSourceFile(call.getCallee());
+    return {};
+}
+
 class CiraRegionFormationPass : public impl::CiraRegionFormationBase<CiraRegionFormationPass> {
 public:
     using impl::CiraRegionFormationBase<CiraRegionFormationPass>::CiraRegionFormationBase;
@@ -39,25 +56,32 @@ public:
     void runOnOperation() override {
         ModuleOp module = getOperation();
         unsigned regionId = 0;
+        unsigned numFuncs = 0, numMemOps = 0, numRoots = 0;
 
-        for (auto func : module.getOps<func::FuncOp>()) {
+        for (auto func : module.getOps<FunctionOpInterface>()) {
             if (func.isExternal())
                 continue;
+            ++numFuncs;
 
             // Collect roots first: the walk mutates the IR.
             SmallVector<Operation *> roots;
             func.walk([&](Operation *op) {
                 if (op->getParentOfType<OffloadRegionOp>())
                     return;
+                if (!getAddressOperands(op).empty())
+                    ++numMemOps;
                 if (isRemoteMemoryAccess(op))
                     roots.push_back(op);
             });
+            numRoots += roots.size();
 
             for (Operation *m : roots)
                 if (formRegion(m, regionId))
                     ++regionId;
         }
 
+        LLVM_DEBUG(llvm::dbgs() << "STATS funcs=" << numFuncs << " memops=" << numMemOps << " roots=" << numRoots
+                                << " regions=" << regionId << "\n");
         if (regionId == 0)
             LLVM_DEBUG(llvm::dbgs() << "no offloadable region found\n");
     }
@@ -116,6 +140,8 @@ private:
         offloadOp->setAttr("cira.region_id", builder.getI32IntegerAttr(regionId));
         offloadOp->setAttr("cira.chain_depth", builder.getI32IntegerAttr(slice.chainDepth));
         offloadOp->setAttr("cira.slice_size", builder.getI32IntegerAttr(slice.ops.size()));
+        if (StringRef source = findSourceFile(loc); !source.empty())
+            offloadOp->setAttr("cira.source", builder.getStringAttr(source));
 
         SmallVector<Location> argLocs(liveIns.size(), loc);
         Block *body = builder.createBlock(&offloadOp.getBody(), {}, liveInTypes, argLocs);

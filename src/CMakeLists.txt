@@ -41,3 +41,14 @@ target_link_libraries(cira PUBLIC
   ${dialect_libs}
   ${conversion_libs}
 )
+
+add_llvm_executable(cira-link tools/cira-link.cpp)
+target_link_libraries(cira-link PUBLIC
+  ${CIRA_BASE_LIBS}
+  MLIRParser
+  MLIRIR
+  MLIRSupport
+  MLIRRemoteMem
+  MLIRCIRTransforms
+  ${dialect_libs}
+)

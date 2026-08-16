@@ -15,11 +15,39 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include "clang/CIR/Dialect/IR/CIRDialect.h"
+
 using namespace mlir;
 using namespace mlir::cira;
+
+//===----------------------------------------------------------------------===//
+// ClangIR (CIR) support
+//===----------------------------------------------------------------------===//
+
+/// Locals are `cir.alloca` slots. An access whose address does not come from a
+/// stack slot goes to the heap or to a global, i.e. it is a candidate for
+/// CXL-resident data.
+static bool isCirStackSlot(Value addr) {
+    Operation *def = addr.getDefiningOp();
+    if (!def)
+        return false;
+    if (isa<::cir::AllocaOp>(def))
+        return true;
+    // Member/element addresses inherit the storage class of their base.
+    if (auto member = dyn_cast<::cir::GetMemberOp>(def))
+        return isCirStackSlot(member.getAddr());
+    if (auto stride = dyn_cast<::cir::PtrStrideOp>(def))
+        return isCirStackSlot(stride.getBase());
+    if (auto base = dyn_cast<::cir::BaseClassAddrOp>(def))
+        return isCirStackSlot(base.getDerivedAddr());
+    if (auto cast = dyn_cast<::cir::CastOp>(def))
+        return isCirStackSlot(cast.getSrc());
+    return false;
+}
 
 //===----------------------------------------------------------------------===//
 // Classification
@@ -64,6 +92,11 @@ bool mlir::cira::isRemoteMemoryAccess(Operation *op) {
             if (isRemoteAddressSpace(operand.getType()))
                 return true;
     }
+
+    if (auto load = dyn_cast<::cir::LoadOp>(op))
+        return !isCirStackSlot(load.getAddr());
+    if (auto store = dyn_cast<::cir::StoreOp>(op))
+        return !isCirStackSlot(store.getAddr());
     return false;
 }
 
@@ -112,6 +145,14 @@ SmallVector<Value> mlir::cira::getAddressOperands(Operation *op) {
         addresses.push_back(store.getAddr());
         return addresses;
     }
+    if (auto load = dyn_cast<::cir::LoadOp>(op)) {
+        addresses.push_back(load.getAddr());
+        return addresses;
+    }
+    if (auto store = dyn_cast<::cir::StoreOp>(op)) {
+        addresses.push_back(store.getAddr());
+        return addresses;
+    }
 
     // Generic fallback: any pointer-like operand.
     for (Value operand : op->getOperands())
@@ -123,7 +164,7 @@ SmallVector<Value> mlir::cira::getAddressOperands(Operation *op) {
 bool mlir::cira::isMemoryRead(Operation *op) {
     if (!op)
         return false;
-    if (isa<LoadAsyncOp, memref::LoadOp, affine::AffineLoadOp, LLVM::LoadOp>(op))
+    if (isa<LoadAsyncOp, memref::LoadOp, affine::AffineLoadOp, LLVM::LoadOp, ::cir::LoadOp>(op))
         return true;
     if (auto effects = dyn_cast<MemoryEffectOpInterface>(op))
         return effects.hasEffect<MemoryEffects::Read>();
@@ -146,6 +187,10 @@ bool mlir::cira::isSupportedSliceOp(Operation *op) {
         return true;
     if (isa<LoadAsyncOp, FutureAwaitOp, GetPaddrOp>(op))
         return true;
+    // CIR address arithmetic and pure value computation.
+    if (isa<::cir::LoadOp, ::cir::PtrStrideOp, ::cir::GetMemberOp, ::cir::BaseClassAddrOp, ::cir::CastOp,
+            ::cir::ConstantOp, ::cir::BinOp, ::cir::UnaryOp, ::cir::CmpOp, ::cir::SelectOp, ::cir::GetGlobalOp>(op))
+        return true;
     return false;
 }
 
@@ -154,9 +199,9 @@ bool mlir::cira::isHostOnlyOp(Operation *op) {
         return false;
     if (op->hasAttr("cira.host_only"))
         return true;
-    if (isa<func::CallOp, LLVM::CallOp, func::CallIndirectOp>(op))
+    if (isa<func::CallOp, LLVM::CallOp, func::CallIndirectOp, ::cir::CallOp>(op))
         return true;
-    if (isa<memref::AllocOp, memref::AllocaOp, memref::DeallocOp, LLVM::AllocaOp>(op))
+    if (isa<memref::AllocOp, memref::AllocaOp, memref::DeallocOp, LLVM::AllocaOp, ::cir::AllocaOp>(op))
         return true;
     // Anything that writes or has unmodelled effects stays on the host, unless
     // it is one of the CIRA ops we explicitly support.
@@ -334,7 +379,7 @@ private:
         if (sliceOps.empty())
             return;
         Operation *top = result.root;
-        while (top->getParentOp() && !isa<func::FuncOp>(top))
+        while (top->getParentOp() && !isa<FunctionOpInterface>(top))
             top = top->getParentOp();
         top->walk<WalkOrder::PreOrder>([&](Operation *op) {
             if (sliceOps.contains(op))
@@ -380,8 +425,8 @@ BackwardSliceResult mlir::cira::computeBackwardSlice(Operation *m, const SliceOp
 
     SliceOptions options = opts;
     if (!options.scope) {
-        if (auto func = m->getParentOfType<func::FuncOp>())
-            options.scope = &func.getBody();
+        if (auto func = m->getParentOfType<FunctionOpInterface>())
+            options.scope = &func.getFunctionBody();
         else
             options.scope = m->getParentRegion();
     }
